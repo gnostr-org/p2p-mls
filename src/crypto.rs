@@ -191,4 +191,56 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn different_identities_produce_distinct_credentials() {
+        let backend = &OpenMlsRustCrypto::default();
+        let cred_a = generate_credential_bundle_from_identity("Alice".into(), backend).unwrap();
+        let cred_b = generate_credential_bundle_from_identity("Bob".into(), backend).unwrap();
+        // Identity bytes must differ
+        assert_ne!(cred_a.identity(), cred_b.identity());
+    }
+
+    #[test]
+    fn key_package_can_be_hashed() {
+        let backend = &OpenMlsRustCrypto::default();
+        let credential =
+            generate_credential_bundle_from_identity("Charlie".into(), backend).unwrap();
+        let kp = generate_key_package_bundle(&credential, backend).unwrap();
+        // hash_ref must succeed
+        kp.hash_ref(backend.crypto())
+            .expect("key package should be hashable");
+    }
+
+    #[test]
+    fn generate_mls_group_creates_empty_group() {
+        let backend = &OpenMlsRustCrypto::default();
+        let credential = generate_credential_bundle_from_identity("Dave".into(), backend).unwrap();
+        let kp = generate_key_package_bundle(&credential, backend).unwrap();
+        let group = generate_mls_group(backend, kp);
+        // A freshly created group has exactly one member (the creator)
+        assert_eq!(group.members().len(), 1);
+    }
+
+    #[test]
+    fn generate_mls_group_from_welcome_round_trips() {
+        let backend = &OpenMlsRustCrypto::default();
+        let creator_cred =
+            generate_credential_bundle_from_identity("Creator".into(), backend).unwrap();
+        let joiner_cred =
+            generate_credential_bundle_from_identity("Joiner".into(), backend).unwrap();
+
+        let creator_kp = generate_key_package_bundle(&creator_cred, backend).unwrap();
+        let joiner_kp = generate_key_package_bundle(&joiner_cred, backend).unwrap();
+
+        let mut creator_group = generate_mls_group(backend, creator_kp);
+        let (_, welcome) = creator_group
+            .add_members(backend, &[joiner_kp])
+            .expect("Could not add member");
+        creator_group.merge_pending_commit().expect("merge failed");
+
+        let joiner_group = generate_mls_group_from_welcome(backend, welcome)
+            .expect("joiner should be able to join from welcome");
+        assert_eq!(joiner_group.members().len(), 2);
+    }
 }

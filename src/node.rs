@@ -139,6 +139,39 @@ mod tests {
     use openmls::prelude::TlsSerializeTrait;
 
     #[test]
+    fn default_node_is_not_group_leader() {
+        let node = Node::default();
+        assert!(!node.is_group_leader());
+    }
+
+    #[test]
+    fn join_new_group_makes_node_leader() {
+        let mut node = Node::default();
+        node.join_new_group();
+        assert!(node.is_group_leader());
+    }
+
+    #[test]
+    fn create_message_without_group_returns_error() {
+        let mut node = Node::default();
+        let result = node.create_message("hello");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_message_without_group_returns_none() {
+        let mut alice = Node::default();
+        alice.join_new_group();
+        // We need a valid MlsMessageOut from within a group context to parse
+        let msg_out = alice.create_message("ping").unwrap();
+        // Now create a separate node that has no group yet
+        let mut observer = Node::default();
+        // parse_message returns Ok(None) when there is no group
+        let result = observer.parse_message(msg_out).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn smoke_test() {
         let mut alice = Node::default();
         alice.join_new_group();
@@ -147,13 +180,42 @@ mod tests {
         let serialized = bob_key_package.tls_serialize_detached().unwrap();
         let bytes_array: &[u8] = &serialized;
         let (_, welcome) = alice.add_member_to_group(KeyPackage::try_from(bytes_array).unwrap());
-        //bob.join_new_group(); TODO figure out why this causes an error
         bob.join_existing_group(welcome).expect("");
         let msg_out = alice.create_message("hi bob").unwrap();
-        let msg = bob
-            .parse_message(msg_out.unwrap())
-            .expect("message parsed")
-            .unwrap();
+        let msg = bob.parse_message(msg_out).expect("message parsed").unwrap();
         assert_eq!(msg, "hi bob");
+    }
+
+    #[test]
+    fn bidirectional_messaging() {
+        let mut alice = Node::default();
+        alice.join_new_group();
+        let mut bob = Node::default();
+        let bob_kp = bob.get_key_package();
+        let serialized = bob_kp.tls_serialize_detached().unwrap();
+        let (_, welcome) =
+            alice.add_member_to_group(KeyPackage::try_from(serialized.as_slice()).unwrap());
+        bob.join_existing_group(welcome).unwrap();
+
+        // Alice → Bob
+        let msg = alice.create_message("hello bob").unwrap();
+        let received = bob.parse_message(msg).unwrap().unwrap();
+        assert_eq!(received, "hello bob");
+
+        // Bob → Alice
+        let reply = bob.create_message("hello alice").unwrap();
+        let received = alice.parse_message(reply).unwrap().unwrap();
+        assert_eq!(received, "hello alice");
+    }
+
+    #[test]
+    fn get_key_package_returns_cloneable_value() {
+        let node = Node::default();
+        let kp1 = node.get_key_package();
+        let kp2 = node.get_key_package();
+        // Both clones should serialize to the same bytes
+        let s1 = kp1.tls_serialize_detached().unwrap();
+        let s2 = kp2.tls_serialize_detached().unwrap();
+        assert_eq!(s1, s2);
     }
 }
