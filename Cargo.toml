@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 openmls = "0.8.1"
 openmls_rust_crypto = "0.5.1"
+openmls_basic_credential = "0.5.0"
 libp2p = { version = "0.56", features = [
     "tcp",
     "noise",
@@ -24,3 +25,4 @@ docopt = "1"
 env_logger = "0.11"
 log = "0.4"
 colored = "2"
+openmls_traits = "0.5.0"

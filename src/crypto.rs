@@ -1,192 +1,161 @@
 use lazy_static;
 
 use openmls::prelude::*;
-use openmls::{
-    credentials::{CredentialBundle, CredentialType},
-    prelude::SignatureScheme,
-};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_traits::{signatures::Signer, OpenMlsProvider};
 
 lazy_static! {
-static ref MLS_GROUP_CONFIG: MlsGroupConfig = MlsGroupConfig::builder()
-    .padding_size(100)
-    .sender_ratchet_configuration(SenderRatchetConfiguration::new(
-        10,   // out_of_order_tolerance
-        2000, // maximum_forward_distance
-    ))
-    .use_ratchet_tree_extension(true)
-    .build();
+    static ref MLS_GROUP_CREATE_CONFIG: MlsGroupCreateConfig = MlsGroupCreateConfig::builder()
+        .ciphersuite(Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519)
+        .padding_size(100)
+        .sender_ratchet_configuration(SenderRatchetConfiguration::new(
+            10,   // out_of_order_tolerance
+            2000, // maximum_forward_distance
+        ))
+        .use_ratchet_tree_extension(true)
+        .build();
 }
 
+/// Create a credential bundle from an identity and store the signing key in the provider.
+///
+/// Returns the [`CredentialWithKey`] and the [`SignatureKeyPair`] needed for signing.
 pub fn generate_credential_bundle_from_identity(
     identity: Vec<u8>,
-    backend: &impl OpenMlsCryptoProvider,
-) -> Result<Credential, CredentialError> {
-    generate_credential_bundle(
-        identity,
-        CredentialType::Basic,
-        SignatureScheme::ED25519,
-        backend,
-    )
+    backend: &impl OpenMlsProvider,
+) -> Result<(CredentialWithKey, SignatureKeyPair), ()> {
+    let credential = BasicCredential::new(identity);
+    let signature_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|_| ())?;
+    signature_keys
+        .store(backend.storage())
+        .map_err(|_| ())?;
+    Ok((
+        CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signature_keys.public().into(),
+        },
+        signature_keys,
+    ))
 }
 
-// A helper to create and store credentials.
-fn generate_credential_bundle(
-    identity: Vec<u8>,
-    credential_type: CredentialType,
-    signature_algorithm: SignatureScheme,
-    backend: &impl OpenMlsCryptoProvider,
-) -> Result<Credential, CredentialError> {
-    let credential_bundle =
-        CredentialBundle::new(identity, credential_type, signature_algorithm, backend)?;
-    let credential_id = credential_bundle
-        .credential()
-        .signature_key()
-        .tls_serialize_detached()
-        .expect("Error serializing signature key.");
-    // Store the credential bundle into the key store so OpenMLS has access
-    // to it.
-    backend
-        .key_store()
-        .store(&credential_id, &credential_bundle)
-        .expect("An unexpected error occurred.");
-    Ok(credential_bundle.into_parts().0)
-}
-pub fn generate_mls_group_from_welcome(
-    backend: &impl OpenMlsCryptoProvider,
-    welcome: Welcome,
-) -> Result<MlsGroup, WelcomeError> {
-    MlsGroup::new_from_welcome(
-        backend,
-        &MLS_GROUP_CONFIG,
-        welcome,
-        None, // We use the ratchet tree extension, so we don't provide a ratchet tree here
-    )
+/// Build a [`KeyPackage`] for the given credential and signer and store the bundle in the
+/// provider's key store.
+pub fn generate_key_package_bundle(
+    ciphersuite: Ciphersuite,
+    credential_with_key: CredentialWithKey,
+    signer: &SignatureKeyPair,
+    backend: &impl OpenMlsProvider,
+) -> Result<KeyPackage, KeyPackageNewError> {
+    KeyPackage::builder()
+        .build(ciphersuite, backend, signer, credential_with_key)
+        .map(|bundle| bundle.key_package().clone())
 }
 
+/// Create a fresh MLS group owned by `credential_with_key` / `signer`.
 pub fn generate_mls_group(
-    backend: &impl OpenMlsCryptoProvider,
-    key_package: KeyPackage,
+    backend: &impl OpenMlsProvider,
+    signer: &impl Signer,
+    credential_with_key: CredentialWithKey,
 ) -> MlsGroup {
     let group_id = GroupId::from_slice(b"Test Group");
-    MlsGroup::new(
+    MlsGroup::new_with_group_id(
         backend,
-        &MLS_GROUP_CONFIG,
+        signer,
+        &MLS_GROUP_CREATE_CONFIG,
         group_id,
-        key_package
-            .hash_ref(backend.crypto())
-            .expect("Could not hash KeyPackage.")
-            .as_slice(),
+        credential_with_key,
     )
     .expect("An unexpected error occurred.")
 }
 
-// A helper to create key package bundles.
-pub fn generate_key_package_bundle(
-    credential: &Credential,
-    backend: &impl OpenMlsCryptoProvider,
-) -> Result<KeyPackage, KeyPackageBundleNewError> {
-    // Fetch the credential bundle from the key store
-    let credential_id = credential
-        .signature_key()
-        .tls_serialize_detached()
-        .expect("Error serializing signature key.");
-    let credential_bundle = backend
-        .key_store()
-        .read(&credential_id)
-        .expect("An unexpected error occurred.");
-
-    // Create the key package bundle
-    let key_package_bundle = KeyPackageBundle::new(
-        &[Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519],
-        &credential_bundle,
-        backend,
-        vec![],
-    )?;
-
-    // Store it in the key store
-    let key_package_id = key_package_bundle
-        .key_package()
-        .hash_ref(backend.crypto())
-        .expect("Could not hash KeyPackage.");
-    backend
-        .key_store()
-        .store(key_package_id.value(), &key_package_bundle)
-        .expect("An unexpected error occurred.");
-    Ok(key_package_bundle.into_parts().0)
+/// Join an existing group from a [`Welcome`] message.
+pub fn generate_mls_group_from_welcome(
+    backend: &OpenMlsRustCrypto,
+    welcome: Welcome,
+) -> Result<MlsGroup, WelcomeError<openmls_rust_crypto::MemoryStorageError>> {
+    StagedWelcome::new_from_welcome(backend, MLS_GROUP_CREATE_CONFIG.join_config(), welcome, None)
+        .and_then(|staged| staged.into_group(backend))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use openmls_rust_crypto::OpenMlsRustCrypto;
+    use tls_codec::Serialize as TlsSerialize;
+
+    const CIPHERSUITE: Ciphersuite =
+        Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
 
     #[test]
     fn smoke_test() -> Result<(), ()> {
-        let backend = &OpenMlsRustCrypto::default();
+        let alice_backend = &OpenMlsRustCrypto::default();
+        let bob_backend = &OpenMlsRustCrypto::default();
 
-        let bob_credential =
-            generate_credential_bundle_from_identity("Bob1".into(), backend).unwrap();
-        let alice_credential =
-            generate_credential_bundle_from_identity("Alice1".into(), backend).unwrap();
+        let (bob_credential, bob_signer) =
+            generate_credential_bundle_from_identity("Bob1".into(), bob_backend).unwrap();
+        let (alice_credential, alice_signer) =
+            generate_credential_bundle_from_identity("Alice1".into(), alice_backend).unwrap();
 
-        let bob_key_package = generate_key_package_bundle(&bob_credential, backend).unwrap();
-        let alice_key_package = generate_key_package_bundle(&alice_credential, backend).unwrap();
+        let bob_key_package =
+            generate_key_package_bundle(CIPHERSUITE, bob_credential, &bob_signer, bob_backend)
+                .unwrap();
 
         let group_id = GroupId::from_slice(b"Test Group");
 
-        // Here is the group
-        let mut alice_group = MlsGroup::new(
-            backend,
-            &MLS_GROUP_CONFIG,
+        let mut alice_group = MlsGroup::new_with_group_id(
+            alice_backend,
+            &alice_signer,
+            &MLS_GROUP_CREATE_CONFIG,
             group_id,
-            alice_key_package
-                .hash_ref(backend.crypto())
-                .expect("Could not hash KeyPackage.")
-                .as_slice(),
+            alice_credential,
         )
         .expect("An unexpected error occurred.");
 
-        let (_, welcome) = alice_group
-            .add_members(backend, &[bob_key_package])
+        let (_, welcome, _) = alice_group
+            .add_members(alice_backend, &alice_signer, &[bob_key_package])
             .expect("Could not add members.");
 
-        // Join a group from a welcome message
         alice_group
-            .merge_pending_commit()
+            .merge_pending_commit(alice_backend)
             .expect("error merging pending commit");
-        // Now Maxim can join the group.
 
-        let mut bob_group = MlsGroup::new_from_welcome(
-            backend,
-            &MLS_GROUP_CONFIG,
-            welcome,
-            // The public tree is need and transferred out of band.
-            // It is also possible to use the [`RatchetTreeExtension`]
-            //Some(alice_group.export_ratchet_tree()),
+        // Serialize + deserialize to extract the Welcome (production-safe path).
+        let welcome_bytes = welcome.tls_serialize_detached().unwrap();
+        let welcome_msg_in = MlsMessageIn::tls_deserialize_exact_bytes(&welcome_bytes).unwrap();
+        let welcome_inner = match welcome_msg_in.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => panic!("expected a Welcome"),
+        };
+        let mut bob_group = StagedWelcome::new_from_welcome(
+            bob_backend,
+            MLS_GROUP_CREATE_CONFIG.join_config(),
+            welcome_inner,
             None,
         )
+        .expect("Error creating staged welcome")
+        .into_group(bob_backend)
         .expect("Error joining group from Welcome");
 
-        // try sending some messages and then updating commit package
         let message_alice = b"Hi, I'm Alice!";
         let mls_message_out = alice_group
-            .create_message(backend, message_alice)
+            .create_message(alice_backend, &alice_signer, message_alice)
             .expect("Error creating application message.");
 
-        let unverified_message = bob_group
-            .parse_message(mls_message_out.into(), backend)
-            .expect("Could not parse message.");
-
+        // Serialize + deserialize to convert MlsMessageOut → MlsMessageIn.
+        let msg_bytes = mls_message_out.tls_serialize_detached().unwrap();
+        let msg_in = MlsMessageIn::tls_deserialize_exact_bytes(&msg_bytes).unwrap();
         let processed_message = bob_group
-            .process_unverified_message(
-                unverified_message,
-                None, // No external signature key
-                backend,
+            .process_message(
+                bob_backend,
+                msg_in
+                    .try_into_protocol_message()
+                    .expect("should be a protocol message"),
             )
-            .expect("Could not process unverified message.");
+            .expect("Could not process message.");
 
-        if let ProcessedMessage::ApplicationMessage(application_message) = processed_message {
-            // Check the message
+        if let ProcessedMessageContent::ApplicationMessage(application_message) =
+            processed_message.into_content()
+        {
             assert_eq!(application_message.into_bytes(), b"Hi, I'm Alice!");
         }
         Ok(())
@@ -195,19 +164,22 @@ mod tests {
     #[test]
     fn different_identities_produce_distinct_credentials() {
         let backend = &OpenMlsRustCrypto::default();
-        let cred_a = generate_credential_bundle_from_identity("Alice".into(), backend).unwrap();
-        let cred_b = generate_credential_bundle_from_identity("Bob".into(), backend).unwrap();
-        // Identity bytes must differ
-        assert_ne!(cred_a.identity(), cred_b.identity());
+        let (cred_a, _) =
+            generate_credential_bundle_from_identity("Alice".into(), backend).unwrap();
+        let (cred_b, _) =
+            generate_credential_bundle_from_identity("Bob".into(), backend).unwrap();
+        assert_ne!(
+            cred_a.credential.serialized_content(),
+            cred_b.credential.serialized_content()
+        );
     }
 
     #[test]
     fn key_package_can_be_hashed() {
         let backend = &OpenMlsRustCrypto::default();
-        let credential =
+        let (credential, signer) =
             generate_credential_bundle_from_identity("Charlie".into(), backend).unwrap();
-        let kp = generate_key_package_bundle(&credential, backend).unwrap();
-        // hash_ref must succeed
+        let kp = generate_key_package_bundle(CIPHERSUITE, credential, &signer, backend).unwrap();
         kp.hash_ref(backend.crypto())
             .expect("key package should be hashable");
     }
@@ -215,32 +187,43 @@ mod tests {
     #[test]
     fn generate_mls_group_creates_empty_group() {
         let backend = &OpenMlsRustCrypto::default();
-        let credential = generate_credential_bundle_from_identity("Dave".into(), backend).unwrap();
-        let kp = generate_key_package_bundle(&credential, backend).unwrap();
-        let group = generate_mls_group(backend, kp);
-        // A freshly created group has exactly one member (the creator)
-        assert_eq!(group.members().len(), 1);
+        let (credential, signer) =
+            generate_credential_bundle_from_identity("Dave".into(), backend).unwrap();
+        let group = generate_mls_group(backend, &signer, credential);
+        assert_eq!(group.members().count(), 1);
     }
 
     #[test]
     fn generate_mls_group_from_welcome_round_trips() {
-        let backend = &OpenMlsRustCrypto::default();
-        let creator_cred =
-            generate_credential_bundle_from_identity("Creator".into(), backend).unwrap();
-        let joiner_cred =
-            generate_credential_bundle_from_identity("Joiner".into(), backend).unwrap();
+        let creator_backend = &OpenMlsRustCrypto::default();
+        let joiner_backend = &OpenMlsRustCrypto::default();
 
-        let creator_kp = generate_key_package_bundle(&creator_cred, backend).unwrap();
-        let joiner_kp = generate_key_package_bundle(&joiner_cred, backend).unwrap();
+        let (creator_cred, creator_signer) =
+            generate_credential_bundle_from_identity("Creator".into(), creator_backend).unwrap();
+        let (joiner_cred, joiner_signer) =
+            generate_credential_bundle_from_identity("Joiner".into(), joiner_backend).unwrap();
 
-        let mut creator_group = generate_mls_group(backend, creator_kp);
-        let (_, welcome) = creator_group
-            .add_members(backend, &[joiner_kp])
+        let joiner_kp =
+            generate_key_package_bundle(CIPHERSUITE, joiner_cred, &joiner_signer, joiner_backend)
+                .unwrap();
+
+        let mut creator_group =
+            generate_mls_group(creator_backend, &creator_signer, creator_cred);
+        let (_, welcome, _) = creator_group
+            .add_members(creator_backend, &creator_signer, &[joiner_kp])
             .expect("Could not add member");
-        creator_group.merge_pending_commit().expect("merge failed");
+        creator_group
+            .merge_pending_commit(creator_backend)
+            .expect("merge failed");
 
-        let joiner_group = generate_mls_group_from_welcome(backend, welcome)
+        let welcome_bytes = welcome.tls_serialize_detached().unwrap();
+        let welcome_msg_in = MlsMessageIn::tls_deserialize_exact_bytes(&welcome_bytes).unwrap();
+        let welcome_inner = match welcome_msg_in.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => panic!("expected a Welcome"),
+        };
+        let joiner_group = generate_mls_group_from_welcome(joiner_backend, welcome_inner)
             .expect("joiner should be able to join from welcome");
-        assert_eq!(joiner_group.members().len(), 2);
+        assert_eq!(joiner_group.members().count(), 2);
     }
 }

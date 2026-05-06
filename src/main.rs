@@ -12,11 +12,10 @@ use libp2p::{
 };
 use mls::cli::parse_stdin;
 use mls::node::Node;
-use openmls::prelude::{
-    KeyPackage, MlsMessageOut, TlsDeserializeTrait, TlsSerializeTrait, Welcome,
-};
+use openmls::prelude::*;
 use std::error::Error;
 use std::sync::Arc;
+use tls_codec::{DeserializeBytes, Serialize as TlsSerialize};
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -51,10 +50,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let cloned_out = out_msg_sender.clone();
 
-    // Spawn away the event loop that will keep the swarm going.
     tokio::spawn(network_event_loop(swarm, out_msg_receiver, in_msg_sender));
 
-    // For demonstration purposes, we create a dedicated task that handles incoming messages.
     let arc_node = Arc::new(Mutex::new(node));
     let cloned_arc_node = Arc::clone(&arc_node);
     tokio::spawn(async move {
@@ -63,39 +60,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 break;
             };
             let inner_node = &mut *cloned_arc_node.lock().await;
-            let bytes_array: &[u8] = &message;
 
-            if let Ok(key_package) = KeyPackage::try_from(bytes_array) {
-                if inner_node.is_group_leader() {
-                    let (msg_out, welcome) = inner_node.add_member_to_group(key_package);
-                    let welcome_serialized = welcome.tls_serialize_detached().unwrap();
-                    let msg_out_serialized = msg_out.tls_serialize_detached().unwrap();
-                    cloned_out.send(welcome_serialized).unwrap();
-                    cloned_out.send(msg_out_serialized).unwrap();
-                    println!(
-                        "Received key package from {:?}, added to group and sent back welcome message and join message for existing members",
-                        peer
-                    );
-                }
-            } else if let Ok(msg_out) = MlsMessageOut::try_from_bytes(bytes_array) {
-                match inner_node.parse_message(msg_out) {
-                    Ok(msg) => {
-                        if let Some(str_msg) = msg {
-                            println!("{}:{}", peer.to_string().red(), str_msg.blue());
+            // All on-wire messages are TLS-encoded MlsMessageOut.
+            let Ok(msg_in) = MlsMessageIn::tls_deserialize_exact_bytes(&message) else {
+                println!("Received unparseable message from {:?}", peer);
+                continue;
+            };
+
+            match msg_in.wire_format() {
+                WireFormat::KeyPackage => {
+                    if let MlsMessageBodyIn::KeyPackage(kp_in) = msg_in.extract() {
+                        if inner_node.is_group_leader() {
+                            match inner_node.validate_key_package_in(kp_in) {
+                                Ok(kp) => {
+                                    let (commit, welcome) = inner_node.add_member_to_group(kp);
+                                    cloned_out
+                                        .send(welcome.tls_serialize_detached().unwrap())
+                                        .unwrap();
+                                    cloned_out
+                                        .send(commit.tls_serialize_detached().unwrap())
+                                        .unwrap();
+                                    println!("Added {:?} to group; sent welcome + commit", peer);
+                                }
+                                Err(e) => {
+                                    println!("Invalid key package from {:?}: {:?}", peer, e);
+                                }
+                            }
                         }
                     }
-                    Err(_) => {
-                        println!("Could not parse message");
+                }
+                WireFormat::Welcome => {
+                    if let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() {
+                        if let Ok(()) = inner_node.join_existing_group(welcome) {
+                            println!("Joined group via welcome from {:?}", peer);
+                        } else {
+                            println!("Could not join group");
+                        }
                     }
                 }
-            } else if let Ok(welcome) = Welcome::tls_deserialize(&mut &*bytes_array) {
-                if let Ok(()) = inner_node.join_existing_group(welcome) {
-                    println!("Received welcome message from from {:?}", peer);
-                } else {
-                    println!("Could not join group");
+                WireFormat::PrivateMessage | WireFormat::PublicMessage => {
+                    match inner_node.parse_message(msg_in) {
+                        Ok(Some(str_msg)) => {
+                            println!("{}:{}", peer.to_string().red(), str_msg.blue());
+                        }
+                        Ok(None) => {}
+                        Err(_) => println!("Could not parse message"),
+                    }
                 }
-            } else {
-                println!("Received: '{:?}' from {:?}", message, peer);
+                _ => {
+                    println!("Received unhandled message type from {:?}", peer);
+                }
             }
         }
     });
@@ -118,19 +132,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Defines the event-loop of our application's network layer.
-///
-/// The event-loop handles some network events itself like mDNS and interacts with the rest
-/// of the application via channels.
-/// Conceptually, this is an actor-ish design.
+/// Network event loop – handles mDNS and floodsub events, forwarding application messages
+/// back to the main task via the `sender` channel.
 async fn network_event_loop(
     mut swarm: Swarm<MyBehaviour>,
     mut receiver: mpsc::UnboundedReceiver<Vec<u8>>,
     sender: mpsc::UnboundedSender<(PeerId, Vec<u8>)>,
 ) {
-    // Create a Floodsub topic
     let chat = floodsub::Topic::new("chat");
-
     swarm.behaviour_mut().floodsub.subscribe(chat.clone());
 
     loop {
@@ -163,7 +172,7 @@ async fn network_event_loop(
                     {
                         sender.send((message.source, message.data.to_vec())).unwrap();
                     }
-                    _ => {} // ignore all other events
+                    _ => {}
                 }
             },
             Some(message) = receiver.recv() => {

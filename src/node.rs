@@ -1,8 +1,6 @@
 use libp2p::{identity::Keypair, PeerId};
-use openmls::{
-    group::MlsGroup,
-    prelude::{KeyPackage, MlsMessageOut, ProcessedMessage, Welcome},
-};
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 
 use crate::{
@@ -13,29 +11,33 @@ use crate::{
     error::NodeError,
 };
 
-#[derive(Debug)]
+const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+
 struct Identity {
     network_key: Keypair,
+    credential_with_key: CredentialWithKey,
+    signer: SignatureKeyPair,
     key_package: KeyPackage,
 }
 
-#[derive(Debug)]
 pub struct Node {
     backend: OpenMlsRustCrypto,
     mls_group: Option<MlsGroup>,
     identity: Identity,
-    is_group_leader: bool, // Only group leader can add new members to the group
+    is_group_leader: bool,
 }
 
 impl Default for Node {
     fn default() -> Node {
         let backend = OpenMlsRustCrypto::default();
         let network_key = Keypair::generate_ed25519();
-        let peer_id = PeerId::from_public_key(&network_key.public());
-        let credential = generate_credential_bundle_from_identity(peer_id.into(), &backend)
-            .expect("error creating credential");
-        let key_package = generate_key_package_bundle(&credential, &backend)
-            .expect("should have no problem with key package");
+        let peer_id = PeerId::from(network_key.public());
+        let (credential_with_key, signer) =
+            generate_credential_bundle_from_identity(peer_id.to_bytes().to_vec(), &backend)
+                .expect("error creating credential");
+        let key_package =
+            generate_key_package_bundle(CIPHERSUITE, credential_with_key.clone(), &signer, &backend)
+                .expect("should have no problem with key package");
 
         Node {
             backend,
@@ -43,6 +45,8 @@ impl Default for Node {
             is_group_leader: false,
             identity: Identity {
                 network_key,
+                credential_with_key,
+                signer,
                 key_package,
             },
         }
@@ -53,7 +57,8 @@ impl Node {
     pub fn join_new_group(&mut self) {
         self.mls_group = Some(generate_mls_group(
             &self.backend,
-            self.identity.key_package.clone(),
+            &self.identity.signer,
+            self.identity.credential_with_key.clone(),
         ));
         self.is_group_leader = true;
     }
@@ -62,15 +67,22 @@ impl Node {
         self.is_group_leader
     }
 
-    pub fn add_member_to_group(&mut self, key_package: KeyPackage) -> (MlsMessageOut, Welcome) {
+    /// Add a member to the group.
+    ///
+    /// Returns the commit message (for existing members) and the welcome message (for the new
+    /// member).
+    pub fn add_member_to_group(
+        &mut self,
+        key_package: KeyPackage,
+    ) -> (MlsMessageOut, MlsMessageOut) {
         let group = self.mls_group.as_mut().expect("group expected");
-        let (m_out, welcome) = group
-            .add_members(&self.backend, &[key_package])
+        let (commit, welcome, _) = group
+            .add_members(&self.backend, &self.identity.signer, &[key_package])
             .expect("Could not add members.");
         group
-            .merge_pending_commit()
+            .merge_pending_commit(&self.backend)
             .expect("error merging pending commit");
-        (m_out, welcome)
+        (commit, welcome)
     }
 
     pub fn join_existing_group(&mut self, welcome: Welcome) -> Result<(), NodeError> {
@@ -84,7 +96,7 @@ impl Node {
             .mls_group
             .as_mut()
             .ok_or_else(|| NodeError("Group required to create message".to_string()))?
-            .create_message(&self.backend, msg.as_bytes())
+            .create_message(&self.backend, &self.identity.signer, msg.as_bytes())
             .expect("Error creating application message."))
     }
 
@@ -92,51 +104,67 @@ impl Node {
         self.identity.key_package.clone()
     }
 
+    /// Validate an incoming [`KeyPackageIn`] and convert it to a verified [`KeyPackage`].
+    pub fn validate_key_package_in(
+        &self,
+        kp_in: KeyPackageIn,
+    ) -> Result<KeyPackage, KeyPackageVerifyError> {
+        kp_in.validate(self.backend.crypto(), ProtocolVersion::default())
+    }
+
     pub fn get_network_keypair(&self) -> Keypair {
         self.identity.network_key.clone()
     }
 
-    pub fn parse_message(&mut self, msg_out: MlsMessageOut) -> Result<Option<String>, NodeError> {
+    /// Parse an incoming MLS message.
+    ///
+    /// Returns `Ok(Some(text))` for application messages, `Ok(None)` for commits / when not yet
+    /// in a group.
+    pub fn parse_message(&mut self, msg: MlsMessageIn) -> Result<Option<String>, NodeError> {
         if self.mls_group.is_none() {
             return Ok(None);
         }
-        let unverified_message = self
+        let protocol_msg = msg
+            .try_into_protocol_message()
+            .map_err(|e| NodeError(e.to_string()))?;
+
+        let processed = self
             .mls_group
             .as_mut()
             .expect("group")
-            .parse_message(msg_out.into(), &self.backend)?;
+            .process_message(&self.backend, protocol_msg)?;
 
-        let processed_message = self
-            .mls_group
-            .as_mut()
-            .expect("group")
-            .process_unverified_message(
-                unverified_message,
-                None, // No external signature key
-                &self.backend,
-            )
-            .expect("Could not process unverified message.");
-
-        if let ProcessedMessage::ApplicationMessage(application_message) = processed_message {
-            // Check the message
-            return Ok(Some(
-                String::from_utf8(application_message.into_bytes()).unwrap(),
-            ));
-        } else if let ProcessedMessage::StagedCommitMessage(staged_commit) = processed_message {
-            self.mls_group
-                .as_mut()
-                .expect("group")
-                .merge_staged_commit(*staged_commit)
-                .expect("Could not merge Commit.");
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(Some(
+                String::from_utf8(app_msg.into_bytes())
+                    .map_err(|e| NodeError(e.to_string()))?,
+            )),
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                self.mls_group
+                    .as_mut()
+                    .expect("group")
+                    .merge_staged_commit(&self.backend, *staged_commit)
+                    .map_err(|e| NodeError(e.to_string()))?;
+                Ok(None)
+            }
+            _ => Ok(None),
         }
-        Ok(None)
     }
+}
+
+/// Serialize an [`MlsMessageOut`] to bytes, then deserialize as [`MlsMessageIn`].
+/// This simulates the on-wire round-trip and is used in tests.
+#[cfg(test)]
+fn msg_out_to_in(msg: MlsMessageOut) -> MlsMessageIn {
+    use tls_codec::Serialize as _;
+    let bytes = msg.tls_serialize_detached().expect("serialization failed");
+    MlsMessageIn::tls_deserialize_exact_bytes(&bytes).expect("deserialization failed")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openmls::prelude::TlsSerializeTrait;
+    use tls_codec::Serialize as _;
 
     #[test]
     fn default_node_is_not_group_leader() {
@@ -162,13 +190,23 @@ mod tests {
     fn parse_message_without_group_returns_none() {
         let mut alice = Node::default();
         alice.join_new_group();
-        // We need a valid MlsMessageOut from within a group context to parse
         let msg_out = alice.create_message("ping").unwrap();
-        // Now create a separate node that has no group yet
         let mut observer = Node::default();
         // parse_message returns Ok(None) when there is no group
-        let result = observer.parse_message(msg_out).unwrap();
+        let result = observer.parse_message(msg_out_to_in(msg_out)).unwrap();
         assert!(result.is_none());
+    }
+
+    fn add_bob_to_alice_group(alice: &mut Node, bob: &mut Node) -> Welcome {
+        let bob_kp = bob.get_key_package();
+        let (_, welcome_msg) = alice.add_member_to_group(bob_kp);
+        // Serialize and re-deserialize to extract the Welcome (production-safe path).
+        let bytes = welcome_msg.tls_serialize_detached().unwrap();
+        let msg_in = MlsMessageIn::tls_deserialize_exact_bytes(&bytes).unwrap();
+        match msg_in.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => panic!("expected a Welcome message"),
+        }
     }
 
     #[test]
@@ -176,13 +214,13 @@ mod tests {
         let mut alice = Node::default();
         alice.join_new_group();
         let mut bob = Node::default();
-        let bob_key_package = bob.get_key_package();
-        let serialized = bob_key_package.tls_serialize_detached().unwrap();
-        let bytes_array: &[u8] = &serialized;
-        let (_, welcome) = alice.add_member_to_group(KeyPackage::try_from(bytes_array).unwrap());
+        let welcome = add_bob_to_alice_group(&mut alice, &mut bob);
         bob.join_existing_group(welcome).expect("");
         let msg_out = alice.create_message("hi bob").unwrap();
-        let msg = bob.parse_message(msg_out).expect("message parsed").unwrap();
+        let msg = bob
+            .parse_message(msg_out_to_in(msg_out))
+            .expect("message parsed")
+            .unwrap();
         assert_eq!(msg, "hi bob");
     }
 
@@ -191,20 +229,17 @@ mod tests {
         let mut alice = Node::default();
         alice.join_new_group();
         let mut bob = Node::default();
-        let bob_kp = bob.get_key_package();
-        let serialized = bob_kp.tls_serialize_detached().unwrap();
-        let (_, welcome) =
-            alice.add_member_to_group(KeyPackage::try_from(serialized.as_slice()).unwrap());
+        let welcome = add_bob_to_alice_group(&mut alice, &mut bob);
         bob.join_existing_group(welcome).unwrap();
 
         // Alice → Bob
         let msg = alice.create_message("hello bob").unwrap();
-        let received = bob.parse_message(msg).unwrap().unwrap();
+        let received = bob.parse_message(msg_out_to_in(msg)).unwrap().unwrap();
         assert_eq!(received, "hello bob");
 
         // Bob → Alice
         let reply = bob.create_message("hello alice").unwrap();
-        let received = alice.parse_message(reply).unwrap().unwrap();
+        let received = alice.parse_message(msg_out_to_in(reply)).unwrap().unwrap();
         assert_eq!(received, "hello alice");
     }
 
@@ -213,7 +248,6 @@ mod tests {
         let node = Node::default();
         let kp1 = node.get_key_package();
         let kp2 = node.get_key_package();
-        // Both clones should serialize to the same bytes
         let s1 = kp1.tls_serialize_detached().unwrap();
         let s2 = kp2.tls_serialize_detached().unwrap();
         assert_eq!(s1, s2);

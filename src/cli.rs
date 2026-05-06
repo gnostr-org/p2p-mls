@@ -1,6 +1,7 @@
 use colored::Colorize;
 use docopt::Docopt;
-use openmls::prelude::TlsSerializeTrait;
+use openmls::prelude::*;
+use tls_codec::Serialize as TlsSerialize;
 
 use crate::{error::NodeError, node::Node};
 
@@ -25,8 +26,8 @@ pub fn parse_stdin(node: &mut Node, line: String) -> Result<Message, NodeError> 
                 node.join_new_group();
             } else if args.get_bool("join") {
                 println!("Joining group.");
-                msg = node
-                    .get_key_package()
+                // Wrap the KeyPackage in MlsMessageOut so the peer can decode it uniformly.
+                msg = MlsMessageOut::from(node.get_key_package())
                     .tls_serialize_detached()
                     .expect("key should serialize");
             } else if !user_message.is_empty() {
@@ -89,3 +90,4 @@ mod tests {
         assert!(msg.is_empty());
     }
 }
+

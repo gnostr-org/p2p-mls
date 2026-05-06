@@ -1,26 +1,26 @@
-use openmls::prelude::{ParseMessageError, WelcomeError};
+use openmls::prelude::{ProcessMessageError, WelcomeError};
+use openmls_rust_crypto::MemoryStorageError;
 use std::fmt::Display;
 
-#[derive(Debug)] /* 1 */
-pub struct NodeError(pub String); /* 2 */
+#[derive(Debug)]
+pub struct NodeError(pub String);
 
-impl std::error::Error for NodeError {} /* 3 */
+impl std::error::Error for NodeError {}
 
-/* 4 */
 impl Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl From<WelcomeError> for NodeError {
-    fn from(error: WelcomeError) -> Self {
+impl From<WelcomeError<MemoryStorageError>> for NodeError {
+    fn from(error: WelcomeError<MemoryStorageError>) -> Self {
         NodeError(error.to_string())
     }
 }
 
-impl From<ParseMessageError> for NodeError {
-    fn from(error: ParseMessageError) -> Self {
+impl From<ProcessMessageError<MemoryStorageError>> for NodeError {
+    fn from(error: ProcessMessageError<MemoryStorageError>) -> Self {
         NodeError(error.to_string())
     }
 }
