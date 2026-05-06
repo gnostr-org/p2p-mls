@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-openmls = "0.4.1"
-openmls_rust_crypto = "0.1.0"
+openmls = "0.8.1"
+openmls_rust_crypto = "0.5.1"
 libp2p = { version = "0.56", features = [
     "tcp",
     "noise",
